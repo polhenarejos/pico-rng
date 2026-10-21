@@ -1,2 +1,15 @@
 build
 .vscode
+
+# docker
+docker-cache/
+
+# build
+driver/CMakeFiles/
+driver/pico_rng.*
+!driver/pico_rng.c
+driver/.pico_rng.*
+driver/[.module|..module|.Module]*
+driver/cmake_install.cmake_install
+driver/cmake_install.cmake
+driver/CMakeCache.txt

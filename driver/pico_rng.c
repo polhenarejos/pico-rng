@@ -4,15 +4,14 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/usb.h>
-#include <linux/slab.h>
-#include <linux/kernel.h>
 #include <linux/hw_random.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/kthread.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/usb.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mickey Malone");
@@ -203,7 +202,7 @@ static ssize_t pico_rng_read(struct file *file, char __user *user_buffer, size_t
 
 	LOGGER_DEBUG("inside pico_rng_read with file %p, user_buffer %p, size %ld, offset %lld\n", file, user_buffer, size, *offset);
 
-    buffer = kmalloc(module_data.endpoint->wMaxPacketSize, GFP_USER);
+    buffer = kmalloc(module_data.endpoint->wMaxPacketSize, GFP_KERNEL);
 	if(!buffer)
 	{
 		LOGGER_ERR("Failed to allocate buffer\n");
@@ -211,15 +210,17 @@ static ssize_t pico_rng_read(struct file *file, char __user *user_buffer, size_t
 	}
 
 	bytes_read = pico_rng_read_data(buffer, module_data.endpoint->wMaxPacketSize);
-	if(!bytes_read)
+	if(bytes_read <= 0)
 	{
 		LOGGER_ERR("Failed to read data\n");
+		kfree(buffer);
 		return -EFAULT;
 	}
 
     LOGGER_DEBUG("Copying %d bytest of random data to userspace with offset %lld\n", bytes_read, *offset);
 	if(copy_to_user(user_buffer, buffer, bytes_read))
 	{
+		kfree(buffer);
         return -EFAULT;
 	}
 	
@@ -236,18 +237,24 @@ static int pico_rng_kthread(void *data)
     int bytes_read;
 	void *buffer = NULL;
 
-	buffer = kmalloc(module_data.endpoint->wMaxPacketSize, GFP_NOWAIT);
+	buffer = kmalloc(module_data.endpoint->wMaxPacketSize, GFP_KERNEL);
 	if(!buffer)
 	{
 		LOGGER_ERR("RNG kthread failed to allocate buffer\n");
-		return -EFAULT;
+		return -ENOMEM;
 	}
 
 	while (!kthread_should_stop())
 	{
 		bytes_read = pico_rng_read_data(buffer, module_data.endpoint->wMaxPacketSize);
-		if(!bytes_read)
+		if(bytes_read <= 0)
 		{
+			if (bytes_read == -ENODEV || bytes_read == -ESHUTDOWN)
+			{
+				LOGGER_INFO("Device disconnected, stopping kthread polling loop\n");
+				break;
+			}
+
 			LOGGER_ERR("Failed to read data\n");
 
 			// sleep for at least a second, max 2 seconds
@@ -259,9 +266,22 @@ static int pico_rng_kthread(void *data)
         LOGGER_DEBUG("Adding hardware randomness\n");
 		// I would not exactly call this rng as trusted, so it will not add entropy, only random bits to the pool
 		// A trusted device would call add_hwgenerator_randomness and credit the entropy pool. For now the credit is 0 while still adding random bits.
-		add_hwgenerator_randomness(buffer, bytes_read, 0);
+		add_hwgenerator_randomness(buffer, bytes_read, 0, false);
 		LOGGER_DEBUG("Randomness added\n");
 	}
+
+	kfree(buffer);
+
+	/*
+	 * If loop ended due to USB unplug, park thread until kthread_stop()
+	 * is explicitly called in pico_rng_usb_disconnect to prevent double free.
+	 */
+	while (!kthread_should_stop())
+	{
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+	}
+	set_current_state(TASK_RUNNING);
 
     return 0;
 }
@@ -305,6 +325,9 @@ static int pico_rng_read_data(void *buffer, int count)
 	LOGGER_DEBUG("Calling usb_bulk_msg dev %p, pipe %u, buffer %p, size %d, and timeout %d", \
 	        module_data.dev, module_data.pipe, buffer, count, timeout);
 
+	if (!module_data.dev)
+		return -ENODEV;
+
     retval = usb_bulk_msg(module_data.dev, 
 	                      module_data.pipe,
 						  buffer,
@@ -314,6 +337,8 @@ static int pico_rng_read_data(void *buffer, int count)
 	
 	if(retval)
 	{
+		if (retval == -ENODEV || retval == -ESHUTDOWN)
+			return retval;
 		return -EFAULT;
 	}
 
